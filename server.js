@@ -31,6 +31,16 @@ app.get('/api/error-demo', asyncHandler(async () => {
   throw new Error('演示错误：Express 全局错误中间件已捕获');
 }));
 
+// 公网出口探针：返回函数出向公网 IP（供 RDS 白名单加白）；失败说明运行时无公网出口
+app.get('/api/egress', asyncHandler(async (req, res) => {
+  try {
+    const r = await fetch('https://api.ipify.org', { signal: AbortSignal.timeout(8000) });
+    res.json({ ok: true, egressIp: (await r.text()).trim() });
+  } catch (err) {
+    res.status(502).json({ ok: false, message: err.message, cause: err.cause ? (err.cause.code || err.cause.message) : null });
+  }
+}));
+
 // ---------------------------------------------------------------------------
 // RDS Supabase 读写路由（supabase-js SDK / Data API 通道）
 // 双链路：默认内网（URL_HTTP），?net=public 切公网（URL_PUBLIC）
@@ -74,7 +84,7 @@ function dbReady(res, supabase, net) {
   return true;
 }
 
-// 白名单校验：schema/table 只允许取自 TABLE_ACL；service_role 绕过 RLS，故 ACL 是唯一访问边界
+// 白名单校验：schema/table 只允许取自 TABLE_ACL；当前用 anon key，RLS 与 ACL 双重约束
 function aclCheck(schema, table, write, res) {
   const allow = TABLE_ACL[schema];
   if (!allow) {
@@ -106,7 +116,7 @@ function dbErrorStatus(err) {
   }
   const sc = Number(err.statusCode || err.status);
   if (sc >= 400 && sc < 600) return sc; // Storage API 等自带 HTTP 状态
-  if (err instanceof TypeError) return 502; // fetch 网络失败
+  if (err instanceof TypeError || err.name === 'TypeError') return 502; // fetch 网络失败（沙箱跨 realm 时 instanceof 失效）
   return 500;
 }
 const dbHandler = (fn) => asyncHandler(async (req, res) => {
@@ -117,9 +127,11 @@ const dbHandler = (fn) => asyncHandler(async (req, res) => {
   try {
     await fn(req, res);
   } catch (err) {
-    if (err.code || err.statusCode || err.status || err instanceof TypeError) {
-      console.error('[db-error]', net, err.code || err.statusCode || err.status, err.message);
-      res.status(dbErrorStatus(err)).json({ error: 'db_error', net, code: err.code || err.statusCode || err.status, message: err.message });
+    if (err.code || err.statusCode || err.status || err instanceof TypeError || err.name === 'TypeError') {
+      // cause 里才有真实网络原因码（ENOTFOUND/ETIMEDOUT/ECONNREFUSED），用于区分白名单丢弃与无公网出口
+      const cause = err.cause ? ` (cause: ${err.cause.code || err.cause.message})` : '';
+      console.error('[db-error]', net, err.code || err.statusCode || err.status, err.message + cause);
+      res.status(dbErrorStatus(err)).json({ error: 'db_error', net, code: err.code || err.statusCode || err.status, message: err.message + cause });
       return;
     }
     throw err;
