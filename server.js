@@ -33,12 +33,23 @@ app.get('/api/error-demo', asyncHandler(async () => {
 
 // ---------------------------------------------------------------------------
 // RDS Supabase 读写路由（supabase-js SDK / Data API 通道）
+// 双链路：默认内网（URL_HTTP），?net=public 切公网（URL_PUBLIC）
 // ---------------------------------------------------------------------------
-const supabaseUrl = process.env.NEXT_PUBLIC_SUPABASE_URL_HTTP_76VC;
-const supabaseKey = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY_76VC;
-const supabase = supabaseUrl && supabaseKey
-  ? createClient(supabaseUrl, supabaseKey, { auth: { persistSession: false, autoRefreshToken: false } })
-  : null;
+const supabaseKey = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY_QV9F;
+const SUPABASE_URLS = {
+  internal: process.env.NEXT_PUBLIC_SUPABASE_URL_HTTP_QV9F,
+  public: process.env.NEXT_PUBLIC_SUPABASE_URL_PUBLIC_QV9F,
+};
+const supabaseClients = {};
+for (const [net, url] of Object.entries(SUPABASE_URLS)) {
+  supabaseClients[net] = url && supabaseKey
+    ? createClient(url, supabaseKey, { auth: { persistSession: false, autoRefreshToken: false } })
+    : null;
+}
+function pickDb(req) {
+  const net = req.query.net === 'public' ? 'public' : 'internal';
+  return { net, url: SUPABASE_URLS[net], supabase: supabaseClients[net] };
+}
 
 // 可访问的表：public 下的业务表；其余为 Supabase 内置表。
 // '*' 表示该 schema 下所有表，public 新建表自动进入访问范围。
@@ -52,11 +63,11 @@ const TABLE_ACL = {
 // 只读 schema：禁止 INSERT/UPDATE/DELETE
 const READ_ONLY_SCHEMAS = new Set(['auth']);
 
-function dbReady(res) {
+function dbReady(res, supabase, net) {
   if (!supabase) {
     res.status(503).json({
       error: 'db_not_configured',
-      message: '缺少环境变量：SUPABASE_URL / SUPABASE_SERVICE_KEY',
+      message: `缺少环境变量：NEXT_PUBLIC_SUPABASE_URL_${net === 'public' ? 'PUBLIC_' : 'HTTP_'}QV9F / NEXT_PUBLIC_SUPABASE_ANON_KEY_QV9F`,
     });
     return false;
   }
@@ -99,12 +110,16 @@ function dbErrorStatus(err) {
   return 500;
 }
 const dbHandler = (fn) => asyncHandler(async (req, res) => {
+  // 每个响应都带实际链路信息，便于测试留证
+  const { net, url } = pickDb(req);
+  res.set('X-Db-Net', net);
+  res.set('X-Db-Url', url || '(missing)');
   try {
     await fn(req, res);
   } catch (err) {
     if (err.code || err.statusCode || err.status || err instanceof TypeError) {
-      console.error('[db-error]', err.code || err.statusCode || err.status, err.message);
-      res.status(dbErrorStatus(err)).json({ error: 'db_error', code: err.code || err.statusCode || err.status, message: err.message });
+      console.error('[db-error]', net, err.code || err.statusCode || err.status, err.message);
+      res.status(dbErrorStatus(err)).json({ error: 'db_error', net, code: err.code || err.statusCode || err.status, message: err.message });
       return;
     }
     throw err;
@@ -118,14 +133,16 @@ const unwrap = ({ data, error, count }) => {
 
 // 连通性检查：对 storage.buckets 做 head count，验证 Data API 链路
 app.get('/api/db/health', dbHandler(async (req, res) => {
-  if (!dbReady(res)) return;
+  const { net, url, supabase } = pickDb(req);
+  if (!dbReady(res, supabase, net)) return;
   const { count } = unwrap(await supabase.schema('storage').from('buckets').select('id', { count: 'exact', head: true }));
-  res.json({ ok: true, via: 'supabase-js', url: supabaseUrl, buckets: count });
+  res.json({ ok: true, via: 'supabase-js', net, url, buckets: count });
 }));
 
 // 白名单清单（静态）：PostgREST 不暴露 information_schema，无法运行时枚举表
 app.get('/api/db/tables', dbHandler(async (req, res) => {
-  if (!dbReady(res)) return;
+  const { net, supabase } = pickDb(req);
+  if (!dbReady(res, supabase, net)) return;
   const tables = [];
   for (const [schema, allow] of Object.entries(TABLE_ACL)) {
     if (allow === '*') tables.push({ table_schema: schema, table_name: '*' });
@@ -136,7 +153,8 @@ app.get('/api/db/tables', dbHandler(async (req, res) => {
 
 // 读：列表（limit/offset 分页）
 app.get('/api/db/:schema/:table', dbHandler(async (req, res) => {
-  if (!dbReady(res)) return;
+  const { net, supabase } = pickDb(req);
+  if (!dbReady(res, supabase, net)) return;
   const { schema, table } = req.params;
   if (!aclCheck(schema, table, false, res)) return;
   const limit = Math.min(Math.max(parseInt(req.query.limit, 10) || 20, 1), 100);
@@ -147,7 +165,8 @@ app.get('/api/db/:schema/:table', dbHandler(async (req, res) => {
 
 // 读：按 id 单行
 app.get('/api/db/:schema/:table/:id', dbHandler(async (req, res) => {
-  if (!dbReady(res)) return;
+  const { net, supabase } = pickDb(req);
+  if (!dbReady(res, supabase, net)) return;
   const { schema, table, id } = req.params;
   if (!aclCheck(schema, table, false, res)) return;
   const { data } = unwrap(await supabase.schema(schema).from(table).select('*').eq('id', id).maybeSingle());
@@ -160,7 +179,8 @@ app.get('/api/db/:schema/:table/:id', dbHandler(async (req, res) => {
 
 // 写：插入（列名由 PostgREST 服务端校验，未知列 PGRST204 → 400）
 app.post('/api/db/:schema/:table', dbHandler(async (req, res) => {
-  if (!dbReady(res)) return;
+  const { net, supabase } = pickDb(req);
+  if (!dbReady(res, supabase, net)) return;
   const { schema, table } = req.params;
   if (!aclCheck(schema, table, true, res)) return;
   if (!req.body || Object.keys(req.body).length === 0) {
@@ -173,7 +193,8 @@ app.post('/api/db/:schema/:table', dbHandler(async (req, res) => {
 
 // 写：按 id 更新（PUT，仅更新请求体提供的字段）
 app.put('/api/db/:schema/:table/:id', dbHandler(async (req, res) => {
-  if (!dbReady(res)) return;
+  const { net, supabase } = pickDb(req);
+  if (!dbReady(res, supabase, net)) return;
   const { schema, table, id } = req.params;
   if (!aclCheck(schema, table, true, res)) return;
   if (!req.body || Object.keys(req.body).length === 0) {
@@ -193,7 +214,8 @@ app.put('/api/db/:schema/:table/:id', dbHandler(async (req, res) => {
 //   buckets → deleteBucket；objects → 先读 bucket_id/name 再 remove
 // 其余 schema 走 PostgREST delete
 app.delete('/api/db/:schema/:table/:id', dbHandler(async (req, res) => {
-  if (!dbReady(res)) return;
+  const { net, supabase } = pickDb(req);
+  if (!dbReady(res, supabase, net)) return;
   const { schema, table, id } = req.params;
   if (!aclCheck(schema, table, true, res)) return;
   if (schema === 'storage') {
