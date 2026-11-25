@@ -17,41 +17,6 @@
   // 此项用于云端构建，CLI 不会因读取此配置自动执行它。
   "buildCommand": "",
 
-  // EdgeFunction 入口：填写相对于项目根目录的边缘函数文件路径。
-  // 不是 Express、Next.js 等 EFC 后端服务的入口。
-  // 不使用 EdgeFunction 时删除此项。
-  "entry": "./server.ts",
-
-  // 是否跳过 EdgeFunction 的编译。
-  // false：由构建工具编译；TypeScript 源码通常使用此值。
-  // true：直接复制入口文件，要求文件已经是可运行的 JavaScript。
-  // 不影响前端构建或 EFC 后端构建。
-  "skipFunctionBuild": false,
-
-  // 静态资源配置：没有静态资源时删除整个 assets。
-  "assets": {
-    // 静态资源目录：填写相对于项目根目录的构建输出路径。
-    // Vite 通常为 ./dist；也可以是 ./public 或 ./build。
-    "directory": "./assets",
-
-    // 未找到静态资源时的处理策略。
-    // singlePageApplication：适用于 SPA，使用 index.html 作为页面回退。
-    // 404Page：适用于静态多页站点，使用 404.html 作为页面回退。
-    // 不需要上述回退行为时删除此项。
-    "notFoundStrategy": "singlePageApplication"
-
-    // HTML URL 处理策略：当前 TestStep 支持将此字段透传给平台。
-    // 仓库未定义合法枚举，下面仅展示字段位置和模拟值；
-    // 确认平台支持该值后，补上前一项的逗号并取消注释。
-    // "htmlHandling": "auto-trailing-slash"
-  },
-
-  // 优先执行 EdgeFunction 的路由：填写以 / 开头的路径模式。
-  // 本例将 /edge/*、/promo/* 交给边缘函数优先处理。
-  // 可改为 true 表示全部请求优先走边缘函数；
-  // false 或删除此项则不启用这种优先规则。
-  "edgeFunctionFirst": ["/edge/*", "/promo/*"],
-
   // EFC 后端配置：仅在项目确实需要并生成 EFC 产物时填写。
   // 纯静态或仅 EdgeFunction 项目应删除整个 regionFunction。
   // 此节点不是后端入口配置，也不能替代后端框架检测和构建。
