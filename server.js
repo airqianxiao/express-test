@@ -43,22 +43,43 @@ app.get('/api/egress', asyncHandler(async (req, res) => {
 
 // ---------------------------------------------------------------------------
 // RDS Supabase 读写路由（supabase-js SDK / Data API 通道）
-// 双链路：默认内网（URL_HTTP），?net=public 切公网（URL_PUBLIC）
+// 多集成共存：?inst=qv9f|cgn7 选实例（默认 qv9f），?net=public 切链路（默认内网）
+// 变量名按控制台实际注入读取：两个集成命名风格不同（后缀式 vs 前缀式）
 // ---------------------------------------------------------------------------
-const supabaseKey = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY_QV9F;
-const SUPABASE_URLS = {
-  internal: process.env.NEXT_PUBLIC_SUPABASE_URL_HTTP_QV9F,
-  public: process.env.NEXT_PUBLIC_SUPABASE_URL_PUBLIC_QV9F,
+const INSTANCES = {
+  qv9f: {
+    region: 'beijing',
+    vars: {
+      internal: 'NEXT_PUBLIC_SUPABASE_URL_HTTP_QV9F',
+      public: 'NEXT_PUBLIC_SUPABASE_URL_PUBLIC_QV9F',
+      key: 'NEXT_PUBLIC_SUPABASE_ANON_KEY_QV9F',
+    },
+  },
+  cgn7: {
+    region: 'hangzhou',
+    vars: {
+      internal: 'CGN7_SUPABASE_URL_HTTP',
+      public: 'CGN7_SUPABASE_URL_PUBLIC',
+      key: 'CGN7_SUPABASE_ANON_KEY',
+    },
+  },
 };
-const supabaseClients = {};
-for (const [net, url] of Object.entries(SUPABASE_URLS)) {
-  supabaseClients[net] = url && supabaseKey
-    ? createClient(url, supabaseKey, { auth: { persistSession: false, autoRefreshToken: false } })
-    : null;
+for (const conf of Object.values(INSTANCES)) {
+  conf.urls = { internal: process.env[conf.vars.internal], public: process.env[conf.vars.public] };
+  conf.key = process.env[conf.vars.key];
+  conf.clients = {};
+  for (const [net, url] of Object.entries(conf.urls)) {
+    conf.clients[net] = url && conf.key
+      ? createClient(url, conf.key, { auth: { persistSession: false, autoRefreshToken: false } })
+      : null;
+  }
 }
 function pickDb(req) {
+  const inst = req.query.inst || 'qv9f';
   const net = req.query.net === 'public' ? 'public' : 'internal';
-  return { net, url: SUPABASE_URLS[net], supabase: supabaseClients[net] };
+  const conf = INSTANCES[inst];
+  if (!conf) return { inst, net, unknown: true };
+  return { inst, net, url: conf.urls[net], supabase: conf.clients[net], vars: conf.vars };
 }
 
 // 可访问的表：public 下的业务表；其余为 Supabase 内置表。
@@ -73,11 +94,11 @@ const TABLE_ACL = {
 // 只读 schema：禁止 INSERT/UPDATE/DELETE
 const READ_ONLY_SCHEMAS = new Set(['auth']);
 
-function dbReady(res, supabase, net) {
+function dbReady(res, supabase, net, vars) {
   if (!supabase) {
     res.status(503).json({
       error: 'db_not_configured',
-      message: `缺少环境变量：NEXT_PUBLIC_SUPABASE_URL_${net === 'public' ? 'PUBLIC_' : 'HTTP_'}QV9F / NEXT_PUBLIC_SUPABASE_ANON_KEY_QV9F`,
+      message: `缺少环境变量：${vars[net === 'public' ? 'public' : 'internal']} / ${vars.key}`,
     });
     return false;
   }
@@ -120,18 +141,23 @@ function dbErrorStatus(err) {
   return 500;
 }
 const dbHandler = (fn) => asyncHandler(async (req, res) => {
-  // 每个响应都带实际链路信息，便于测试留证
-  const { net, url } = pickDb(req);
+  // 每个响应都带实际实例与链路信息，便于测试留证
+  const { inst, net, url, unknown } = pickDb(req);
+  res.set('X-Db-Inst', inst);
   res.set('X-Db-Net', net);
   res.set('X-Db-Url', url || '(missing)');
+  if (unknown) {
+    res.status(400).json({ error: 'unknown_instance', message: `inst 不在注册表：${inst}，可选 ${Object.keys(INSTANCES).join('/')}` });
+    return;
+  }
   try {
     await fn(req, res);
   } catch (err) {
     if (err.code || err.statusCode || err.status || err instanceof TypeError || err.name === 'TypeError') {
       // cause 里才有真实网络原因码（ENOTFOUND/ETIMEDOUT/ECONNREFUSED），用于区分白名单丢弃与无公网出口
       const cause = err.cause ? ` (cause: ${err.cause.code || err.cause.message})` : '';
-      console.error('[db-error]', net, err.code || err.statusCode || err.status, err.message + cause);
-      res.status(dbErrorStatus(err)).json({ error: 'db_error', net, code: err.code || err.statusCode || err.status, message: err.message + cause });
+      console.error('[db-error]', inst, net, err.code || err.statusCode || err.status, err.message + cause);
+      res.status(dbErrorStatus(err)).json({ error: 'db_error', inst, net, code: err.code || err.statusCode || err.status, message: err.message + cause });
       return;
     }
     throw err;
@@ -145,16 +171,26 @@ const unwrap = ({ data, error, count }) => {
 
 // 连通性检查：对 storage.buckets 做 head count，验证 Data API 链路
 app.get('/api/db/health', dbHandler(async (req, res) => {
-  const { net, url, supabase } = pickDb(req);
-  if (!dbReady(res, supabase, net)) return;
+  const { inst, net, url, supabase, vars } = pickDb(req);
+  if (!dbReady(res, supabase, net, vars)) return;
   const { count } = unwrap(await supabase.schema('storage').from('buckets').select('id', { count: 'exact', head: true }));
-  res.json({ ok: true, via: 'supabase-js', net, url, buckets: count });
+  res.json({ ok: true, via: 'supabase-js', inst, net, url, buckets: count });
 }));
+
+// 集成清单（静态配置回显，不含密钥）：核对多集成变量是否注入齐全
+app.get('/api/db/instances', (req, res) => {
+  res.json({
+    default: 'qv9f',
+    instances: Object.entries(INSTANCES).map(([id, c]) => ({
+      inst: id, region: c.region, vars: c.vars, urls: c.urls, keyPresent: Boolean(c.key),
+    })),
+  });
+});
 
 // 白名单清单（静态）：PostgREST 不暴露 information_schema，无法运行时枚举表
 app.get('/api/db/tables', dbHandler(async (req, res) => {
-  const { net, supabase } = pickDb(req);
-  if (!dbReady(res, supabase, net)) return;
+  const { net, supabase, vars } = pickDb(req);
+  if (!dbReady(res, supabase, net, vars)) return;
   const tables = [];
   for (const [schema, allow] of Object.entries(TABLE_ACL)) {
     if (allow === '*') tables.push({ table_schema: schema, table_name: '*' });
@@ -165,8 +201,8 @@ app.get('/api/db/tables', dbHandler(async (req, res) => {
 
 // 读：列表（limit/offset 分页）
 app.get('/api/db/:schema/:table', dbHandler(async (req, res) => {
-  const { net, supabase } = pickDb(req);
-  if (!dbReady(res, supabase, net)) return;
+  const { net, supabase, vars } = pickDb(req);
+  if (!dbReady(res, supabase, net, vars)) return;
   const { schema, table } = req.params;
   if (!aclCheck(schema, table, false, res)) return;
   const limit = Math.min(Math.max(parseInt(req.query.limit, 10) || 20, 1), 100);
@@ -177,8 +213,8 @@ app.get('/api/db/:schema/:table', dbHandler(async (req, res) => {
 
 // 读：按 id 单行
 app.get('/api/db/:schema/:table/:id', dbHandler(async (req, res) => {
-  const { net, supabase } = pickDb(req);
-  if (!dbReady(res, supabase, net)) return;
+  const { net, supabase, vars } = pickDb(req);
+  if (!dbReady(res, supabase, net, vars)) return;
   const { schema, table, id } = req.params;
   if (!aclCheck(schema, table, false, res)) return;
   const { data } = unwrap(await supabase.schema(schema).from(table).select('*').eq('id', id).maybeSingle());
@@ -191,8 +227,8 @@ app.get('/api/db/:schema/:table/:id', dbHandler(async (req, res) => {
 
 // 写：插入（列名由 PostgREST 服务端校验，未知列 PGRST204 → 400）
 app.post('/api/db/:schema/:table', dbHandler(async (req, res) => {
-  const { net, supabase } = pickDb(req);
-  if (!dbReady(res, supabase, net)) return;
+  const { net, supabase, vars } = pickDb(req);
+  if (!dbReady(res, supabase, net, vars)) return;
   const { schema, table } = req.params;
   if (!aclCheck(schema, table, true, res)) return;
   if (!req.body || Object.keys(req.body).length === 0) {
@@ -205,8 +241,8 @@ app.post('/api/db/:schema/:table', dbHandler(async (req, res) => {
 
 // 写：按 id 更新（PUT，仅更新请求体提供的字段）
 app.put('/api/db/:schema/:table/:id', dbHandler(async (req, res) => {
-  const { net, supabase } = pickDb(req);
-  if (!dbReady(res, supabase, net)) return;
+  const { net, supabase, vars } = pickDb(req);
+  if (!dbReady(res, supabase, net, vars)) return;
   const { schema, table, id } = req.params;
   if (!aclCheck(schema, table, true, res)) return;
   if (!req.body || Object.keys(req.body).length === 0) {
@@ -226,8 +262,8 @@ app.put('/api/db/:schema/:table/:id', dbHandler(async (req, res) => {
 //   buckets → deleteBucket；objects → 先读 bucket_id/name 再 remove
 // 其余 schema 走 PostgREST delete
 app.delete('/api/db/:schema/:table/:id', dbHandler(async (req, res) => {
-  const { net, supabase } = pickDb(req);
-  if (!dbReady(res, supabase, net)) return;
+  const { net, supabase, vars } = pickDb(req);
+  if (!dbReady(res, supabase, net, vars)) return;
   const { schema, table, id } = req.params;
   if (!aclCheck(schema, table, true, res)) return;
   if (schema === 'storage') {
