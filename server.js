@@ -293,16 +293,41 @@ app.delete('/api/db/:schema/:table/:id', dbHandler(async (req, res) => {
 // ---------------------------------------------------------------------------
 // OSS 读写路由（ali-oss SDK + @alicloud/credentials 凭证链）
 // PRD §4.3：STS 临时凭证不落函数变量，凭证链从 ALIBABA_CLOUD_CREDENTIALS_URI 拉取并自动续期
-// ?net=public 切链路（默认内网）；X-Oss-* 头留证；写/删仅限 probe/ 前缀防误伤桶内对象
+// 多集成共存：?inst=sjyq|ywpx 选实例（默认 sjyq），?net=public 切链路（默认内网）
+// X-Oss-* 头留证；写/删仅限 probe/ 前缀防误伤桶内对象
 // ---------------------------------------------------------------------------
-const OSS_CONF = {
-  bucket: process.env.SJYQ_OSS_ASSETS_BUCKET,
-  region: process.env.SJYQ_OSS_ASSETS_REGION,
-  endpoints: {
-    internal: process.env.SJYQ_OSS_ASSETS_ENDPOINT_INTERNAL,
-    public: process.env.SJYQ_OSS_ASSETS_ENDPOINT_PUBLIC,
+const OSS_INSTANCES = {
+  sjyq: {
+    region: 'beijing',
+    vars: {
+      bucket: 'SJYQ_OSS_ASSETS_BUCKET',
+      internal: 'SJYQ_OSS_ASSETS_ENDPOINT_INTERNAL',
+      public: 'SJYQ_OSS_ASSETS_ENDPOINT_PUBLIC',
+      region: 'SJYQ_OSS_ASSETS_REGION',
+    },
+  },
+  ywpx: {
+    region: 'hangzhou',
+    vars: {
+      bucket: 'YWPX_OSS_ASSETS_BUCKET',
+      internal: 'YWPX_OSS_ASSETS_ENDPOINT_INTERNAL',
+      public: 'YWPX_OSS_ASSETS_ENDPOINT_PUBLIC',
+      region: 'YWPX_OSS_ASSETS_REGION',
+    },
   },
 };
+for (const conf of Object.values(OSS_INSTANCES)) {
+  conf.bucket = process.env[conf.vars.bucket];
+  conf.region = process.env[conf.vars.region];
+  conf.endpoints = { internal: process.env[conf.vars.internal], public: process.env[conf.vars.public] };
+}
+function pickOss(req) {
+  const inst = req.query.inst || 'sjyq';
+  const net = req.query.net === 'public' ? 'public' : 'internal';
+  const conf = OSS_INSTANCES[inst];
+  if (!conf) return { inst, net, unknown: true };
+  return { inst, net, conf };
+}
 
 // 凭证来源判别：credentials_uri=PRD 方式 A；static_sts_env=早期错误实现（观察项）；其余走默认凭证链
 function ossCredentialSource() {
@@ -322,16 +347,18 @@ function ossCredential() {
 }
 
 const ossClients = {};
-async function ossClient(net) {
-  if (ossClients[net]) return ossClients[net];
-  const endpoint = OSS_CONF.endpoints[net];
-  if (!OSS_CONF.bucket || !endpoint) return null;
+async function ossClient(inst, net) {
+  const cacheKey = `${inst}:${net}`;
+  if (ossClients[cacheKey]) return ossClients[cacheKey];
+  const conf = OSS_INSTANCES[inst];
+  const endpoint = conf.endpoints[net];
+  if (!conf.bucket || !endpoint) return null;
   const c = await ossCredential().getCredential();
   // 注入 region 为 cn-beijing 式（PRD 示例为 oss-cn-beijing 式），补 oss- 前缀兼容 SDK
-  const region = OSS_CONF.region && !OSS_CONF.region.startsWith('oss-') ? `oss-${OSS_CONF.region}` : OSS_CONF.region;
-  ossClients[net] = new OSS({
+  const region = conf.region && !conf.region.startsWith('oss-') ? `oss-${conf.region}` : conf.region;
+  ossClients[cacheKey] = new OSS({
     region,
-    bucket: OSS_CONF.bucket,
+    bucket: conf.bucket,
     endpoint,
     accessKeyId: c.accessKeyId,
     accessKeySecret: c.accessKeySecret,
@@ -343,14 +370,15 @@ async function ossClient(net) {
     },
     refreshSTSTokenInterval: 15 * 60 * 1000,
   });
-  return ossClients[net];
+  return ossClients[cacheKey];
 }
 
-function ossReady(res, client, net) {
+function ossReady(res, client, inst, net) {
   if (!client) {
+    const vars = OSS_INSTANCES[inst].vars;
     res.status(503).json({
       error: 'oss_not_configured',
-      message: `缺少环境变量：SJYQ_OSS_ASSETS_${net === 'public' ? 'ENDPOINT_PUBLIC' : 'ENDPOINT_INTERNAL'} / SJYQ_OSS_ASSETS_BUCKET`,
+      message: `缺少环境变量：${vars[net === 'public' ? 'public' : 'internal']} / ${vars.bucket}`,
     });
     return false;
   }
@@ -369,19 +397,23 @@ function ossErrorStatus(err) {
   return 500;
 }
 const ossHandler = (fn) => asyncHandler(async (req, res) => {
-  const net = req.query.net === 'public' ? 'public' : 'internal';
+  const { inst, net, conf, unknown } = pickOss(req);
+  res.set('X-Oss-Inst', inst);
   res.set('X-Oss-Net', net);
-  res.set('X-Oss-Bucket', OSS_CONF.bucket || '(missing)');
-  res.set('X-Oss-Endpoint', OSS_CONF.endpoints[net] || '(missing)');
+  res.set('X-Oss-Bucket', (conf && conf.bucket) || '(missing)');
+  res.set('X-Oss-Endpoint', (conf && conf.endpoints[net]) || '(missing)');
+  if (unknown) {
+    res.status(400).json({ error: 'unknown_instance', message: `inst 不在注册表：${inst}，可选 ${Object.keys(OSS_INSTANCES).join('/')}` });
+    return;
+  }
   try {
     await fn(req, res);
   } catch (err) {
     const cause = err.cause ? ` (cause: ${err.cause.code || err.cause.message})` : '';
-    console.error('[oss-error]', net, err.code || err.status, err.message + cause);
-    res.status(ossErrorStatus(err)).json({ error: 'oss_error', net, code: err.code || err.status, message: err.message + cause });
+    console.error('[oss-error]', inst, net, err.code || err.status, err.message + cause);
+    res.status(ossErrorStatus(err)).json({ error: 'oss_error', inst, net, code: err.code || err.status, message: err.message + cause });
   }
 });
-const ossNet = (req) => (req.query.net === 'public' ? 'public' : 'internal');
 // 写/删只允许 probe/ 前缀（测试命名空间），读/列举不限
 const ossWriteKeyCheck = (key, res) => {
   if (!key || !key.startsWith('probe/')) {
@@ -391,79 +423,81 @@ const ossWriteKeyCheck = (key, res) => {
   return true;
 };
 
-// 配置回显（不含密钥）：核对注入变量与凭证通道是否就绪
-app.get('/api/oss/config', (req, res) => {
+// 多实例配置回显（不含密钥）：核对注入变量与凭证通道是否就绪
+app.get('/api/oss/instances', (req, res) => {
   res.json({
-    bucket: OSS_CONF.bucket,
-    region: OSS_CONF.region,
-    endpoints: OSS_CONF.endpoints,
+    default: 'sjyq',
     credentialSource: ossCredentialSource(),
     credentialsUriPresent: Boolean(process.env.ALIBABA_CLOUD_CREDENTIALS_URI),
     roleArnPresent: Boolean(process.env.ALIBABA_CLOUD_ROLE_ARN),
+    instances: Object.entries(OSS_INSTANCES).map(([id, c]) => ({
+      inst: id, region: c.region, vars: c.vars, bucket: c.bucket, endpoints: c.endpoints,
+    })),
   });
 });
 
 // 连通性检查：getBucketInfo 真实调用，验证链路 + 凭证
 app.get('/api/oss/health', ossHandler(async (req, res) => {
-  const net = ossNet(req);
-  const client = await ossClient(net);
-  if (!ossReady(res, client, net)) return;
+  const { inst, net, conf } = pickOss(req);
+  const client = await ossClient(inst, net);
+  if (!ossReady(res, client, inst, net)) return;
   const info = await client.getBucketInfo();
   res.json({
-    ok: true, net, bucket: OSS_CONF.bucket, endpoint: OSS_CONF.endpoints[net],
+    ok: true, inst, net, bucket: conf.bucket, endpoint: conf.endpoints[net],
     credentialSource: ossCredentialSource(), location: info.bucket.Location, storageClass: info.bucket.StorageClass,
   });
 }));
 
 // 读：列举对象（prefix/limit）
 app.get('/api/oss/objects', ossHandler(async (req, res) => {
-  const net = ossNet(req);
-  const client = await ossClient(net);
-  if (!ossReady(res, client, net)) return;
+  const { inst, net, conf } = pickOss(req);
+  const client = await ossClient(inst, net);
+  if (!ossReady(res, client, inst, net)) return;
   const limit = Math.min(Math.max(parseInt(req.query.limit, 10) || 20, 1), 100);
   const r = await client.list({ prefix: req.query.prefix || '', 'max-keys': limit }, {});
   const objects = (r.objects || []).map((o) => ({ name: o.name, size: o.size, lastModified: o.lastModified }));
-  res.json({ net, prefix: req.query.prefix || '', count: objects.length, isTruncated: r.isTruncated, objects });
+  res.json({ inst, net, prefix: req.query.prefix || '', count: objects.length, isTruncated: r.isTruncated, objects });
 }));
 
 // 读：按 key 取对象内容（文本）
 app.get('/api/oss/object', ossHandler(async (req, res) => {
-  const net = ossNet(req);
-  const client = await ossClient(net);
-  if (!ossReady(res, client, net)) return;
+  const { inst, net, conf } = pickOss(req);
+  const client = await ossClient(inst, net);
+  if (!ossReady(res, client, inst, net)) return;
   const key = req.query.key;
   if (!key) {
     res.status(400).json({ error: 'missing_key', message: 'query 参数 key 必填' });
     return;
   }
   const r = await client.get(key);
-  res.json({ net, key, content: r.content.toString('utf8') });
+  res.json({ inst, net, key, content: r.content.toString('utf8') });
 }));
 
 // 写：上传对象（probe/ 前缀）
 app.post('/api/oss/object', ossHandler(async (req, res) => {
-  const net = ossNet(req);
-  const client = await ossClient(net);
-  if (!ossReady(res, client, net)) return;
+  const { inst, net, conf } = pickOss(req);
+  const client = await ossClient(inst, net);
+  if (!ossReady(res, client, inst, net)) return;
   const { key, content } = req.body || {};
   if (!key || typeof content !== 'string') {
     res.status(400).json({ error: 'empty_body', message: '请求体需含 key 与字符串 content' });
     return;
   }
   if (!ossWriteKeyCheck(key, res)) return;
-  const r = await client.put(key, Buffer.from(content, 'utf8'));
-  res.status(201).json({ net, key, name: r.name, url: r.url });
+  // 桶默认归档类时默认类对象直读报 InvalidObjectState，且角色无 RestoreObject 权限；探针对象显式 Standard
+  const r = await client.put(key, Buffer.from(content, 'utf8'), { headers: { 'x-oss-storage-class': 'Standard' } });
+  res.status(201).json({ inst, net, key, name: r.name, url: r.url });
 }));
 
 // 写：按 key 删除（probe/ 前缀；OSS 删不存在对象也 204，删后判存在用 GET 404）
 app.delete('/api/oss/object', ossHandler(async (req, res) => {
-  const net = ossNet(req);
-  const client = await ossClient(net);
-  if (!ossReady(res, client, net)) return;
+  const { inst, net, conf } = pickOss(req);
+  const client = await ossClient(inst, net);
+  if (!ossReady(res, client, inst, net)) return;
   const key = req.query.key;
   if (!ossWriteKeyCheck(key, res)) return;
   await client.delete(key);
-  res.json({ net, deleted: key });
+  res.json({ inst, net, deleted: key });
 }));
 
 // 全局错误处理中间件（四参数，Express 识别为错误处理器）
