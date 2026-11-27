@@ -5,6 +5,7 @@ const express = require('express');
 const path = require('path');
 const { createClient } = require('@supabase/supabase-js');
 const OSS = require('ali-oss');
+const MNSClient = require('@alicloud/mns');
 const Credential = require('@alicloud/credentials').default;
 const app = express();
 
@@ -330,20 +331,20 @@ function pickOss(req) {
 }
 
 // 凭证来源判别：credentials_uri=PRD 方式 A；static_sts_env=早期错误实现（观察项）；其余走默认凭证链
-function ossCredentialSource() {
+function cloudCredentialSource() {
   if (process.env.ALIBABA_CLOUD_CREDENTIALS_URI) return 'credentials_uri';
   if (process.env.ALIBABA_CLOUD_ACCESS_KEY_ID && process.env.ALIBABA_CLOUD_SECURITY_TOKEN) return 'static_sts_env';
   return 'default_chain';
 }
 // 延迟构造：凭证链缺失时只影响 OSS 路由，不让进程启动即崩
-let ossCred = null;
-function ossCredential() {
-  if (!ossCred) {
-    ossCred = process.env.ALIBABA_CLOUD_CREDENTIALS_URI
+let cloudCred = null;
+function cloudCredential() {
+  if (!cloudCred) {
+    cloudCred = process.env.ALIBABA_CLOUD_CREDENTIALS_URI
       ? new Credential({ type: 'credentials_uri', credentialsURI: process.env.ALIBABA_CLOUD_CREDENTIALS_URI })
       : new Credential();
   }
-  return ossCred;
+  return cloudCred;
 }
 
 const ossClients = {};
@@ -353,7 +354,7 @@ async function ossClient(inst, net) {
   const conf = OSS_INSTANCES[inst];
   const endpoint = conf.endpoints[net];
   if (!conf.bucket || !endpoint) return null;
-  const c = await ossCredential().getCredential();
+  const c = await cloudCredential().getCredential();
   // 注入 region 为 cn-beijing 式（PRD 示例为 oss-cn-beijing 式），补 oss- 前缀兼容 SDK
   const region = conf.region && !conf.region.startsWith('oss-') ? `oss-${conf.region}` : conf.region;
   ossClients[cacheKey] = new OSS({
@@ -365,7 +366,7 @@ async function ossClient(inst, net) {
     stsToken: c.securityToken,
     secure: true,
     refreshSTSToken: async () => {
-      const n = await ossCredential().getCredential();
+      const n = await cloudCredential().getCredential();
       return { accessKeyId: n.accessKeyId, accessKeySecret: n.accessKeySecret, stsToken: n.securityToken };
     },
     refreshSTSTokenInterval: 15 * 60 * 1000,
@@ -427,7 +428,7 @@ const ossWriteKeyCheck = (key, res) => {
 app.get('/api/oss/instances', (req, res) => {
   res.json({
     default: 'sjyq',
-    credentialSource: ossCredentialSource(),
+    credentialSource: cloudCredentialSource(),
     credentialsUriPresent: Boolean(process.env.ALIBABA_CLOUD_CREDENTIALS_URI),
     roleArnPresent: Boolean(process.env.ALIBABA_CLOUD_ROLE_ARN),
     instances: Object.entries(OSS_INSTANCES).map(([id, c]) => ({
@@ -444,7 +445,7 @@ app.get('/api/oss/health', ossHandler(async (req, res) => {
   const info = await client.getBucketInfo();
   res.json({
     ok: true, inst, net, bucket: conf.bucket, endpoint: conf.endpoints[net],
-    credentialSource: ossCredentialSource(), location: info.bucket.Location, storageClass: info.bucket.StorageClass,
+    credentialSource: cloudCredentialSource(), location: info.bucket.Location, storageClass: info.bucket.StorageClass,
   });
 }));
 
@@ -498,6 +499,167 @@ app.delete('/api/oss/object', ossHandler(async (req, res) => {
   if (!ossWriteKeyCheck(key, res)) return;
   await client.delete(key);
   res.json({ inst, net, deleted: key });
+}));
+
+// ---------------------------------------------------------------------------
+// MNS 主题模式路由（@alicloud/mns SDK，与 OSS 共用运行时凭证链）
+// PRD §5/§6：接入链路内网/公网可选（?net=public）；推送链路是函数自身公网 URL，本期只验接入连通
+// 控制台未注入 ACCOUNT_ID（PRD §5.2 有），UID 从 endpoint 首段解析；X-Mns-* 头留证
+// ---------------------------------------------------------------------------
+const MNS_INSTANCES = {
+  bz8l: {
+    region: 'beijing',
+    vars: {
+      internal: 'BZ8L_MNS_ASSETS_ENDPOINT_INTERNAL',
+      public: 'BZ8L_MNS_ASSETS_ENDPOINT_PUBLIC',
+      region: 'BZ8L_MNS_REGION',
+      topic: 'BZ8L_MNS_TOPIC_NAME',
+    },
+  },
+};
+for (const conf of Object.values(MNS_INSTANCES)) {
+  conf.region = process.env[conf.vars.region];
+  conf.topic = process.env[conf.vars.topic];
+  conf.endpoints = { internal: process.env[conf.vars.internal], public: process.env[conf.vars.public] };
+  const host = conf.endpoints.internal || conf.endpoints.public || '';
+  const m = /^(\d+)\.mns\./.exec(host);
+  conf.accountId = m ? m[1] : undefined;
+}
+function pickMns(req) {
+  const inst = req.query.inst || 'bz8l';
+  const net = req.query.net === 'public' ? 'public' : 'internal';
+  const conf = MNS_INSTANCES[inst];
+  if (!conf) return { inst, net, unknown: true };
+  return { inst, net, conf };
+}
+
+const mnsClients = {};
+async function mnsClient(inst, net) {
+  const cacheKey = `${inst}:${net}`;
+  if (mnsClients[cacheKey]) return mnsClients[cacheKey];
+  const conf = MNS_INSTANCES[inst];
+  const host = conf.endpoints[net];
+  if (!conf.accountId || !host) return null;
+  const c = await cloudCredential().getCredential();
+  // SDK 1.2.0 要求自定义 endpoint 必须带 scheme，注入变量为裸域名，补 https
+  const endpoint = /^https?:\/\//.test(host) ? host : `https://${host}`;
+  mnsClients[cacheKey] = new MNSClient(conf.accountId, {
+    region: conf.region,
+    endpoint,
+    accessKeyId: c.accessKeyId,
+    accessKeySecret: c.accessKeySecret,
+    securityToken: c.securityToken,
+    refreshSTSToken: async () => {
+      const n = await cloudCredential().getCredential();
+      return { accessKeyId: n.accessKeyId, accessKeySecret: n.accessKeySecret, securityToken: n.securityToken };
+    },
+    refreshSTSTokenInterval: 15 * 60 * 1000,
+    // 短超时：不可达链路快速失败，避免挂到边缘 524
+    connectTimeout: 8 * 1000,
+    readTimeout: 15 * 1000,
+  });
+  return mnsClients[cacheKey];
+}
+
+function mnsReady(res, client, inst, net) {
+  if (!client) {
+    const vars = MNS_INSTANCES[inst].vars;
+    res.status(503).json({
+      error: 'mns_not_configured',
+      message: `缺少环境变量：${vars[net === 'public' ? 'public' : 'internal']}（或无法从 endpoint 解析 ACCOUNT_ID）`,
+    });
+    return false;
+  }
+  return true;
+}
+
+// SDK 错误形态：name='MNS<Code>Error'、message 含 "failed with <status>"，无 code/status 字段
+function mnsErrorInfo(err) {
+  const m = /^MNS(.+)Error$/.exec(err.name || '');
+  const sm = /failed with (\d{3})/.exec(err.message || '');
+  return { code: m ? m[1] : err.code, status: sm ? Number(sm[1]) : undefined };
+}
+function mnsErrorStatus(err) {
+  const { code, status } = mnsErrorInfo(err);
+  if (code === 'AccessDenied' || code === 'InvalidAccessKeyId' || code === 'SecurityTokenExpired' || code === 'InvalidSecurityToken') return 403;
+  if (code === 'TopicNotExist' || code === 'SubscriptionNotExist') return 404;
+  if (status >= 400 && status < 600) return status;
+  if (/fetch failed|ECONNREFUSED|ENOTFOUND|ETIMEDOUT|EAI_AGAIN|socket hang up|timeout/i.test(err.code || err.message)) return 502;
+  return 500;
+}
+const mnsHandler = (fn) => asyncHandler(async (req, res) => {
+  const { inst, net, conf, unknown } = pickMns(req);
+  res.set('X-Mns-Inst', inst);
+  res.set('X-Mns-Net', net);
+  res.set('X-Mns-Endpoint', (conf && conf.endpoints[net]) || '(missing)');
+  res.set('X-Mns-Topic', (conf && conf.topic) || '(missing)');
+  if (unknown) {
+    res.status(400).json({ error: 'unknown_instance', message: `inst 不在注册表：${inst}，可选 ${Object.keys(MNS_INSTANCES).join('/')}` });
+    return;
+  }
+  try {
+    await fn(req, res);
+  } catch (err) {
+    const { code } = mnsErrorInfo(err);
+    const cause = err.cause ? ` (cause: ${err.cause.code || err.cause.message})` : '';
+    console.error('[mns-error]', inst, net, code, err.message + cause);
+    res.status(mnsErrorStatus(err)).json({ error: 'mns_error', inst, net, code, message: err.message + cause });
+  }
+});
+
+// 多实例配置回显（不含密钥）：accountId 为 endpoint 解析出的 UID
+app.get('/api/mns/instances', (req, res) => {
+  res.json({
+    default: 'bz8l',
+    credentialSource: cloudCredentialSource(),
+    instances: Object.entries(MNS_INSTANCES).map(([id, c]) => ({
+      inst: id, region: c.region, vars: c.vars, accountId: c.accountId, topic: c.topic, endpoints: c.endpoints,
+    })),
+  });
+});
+
+// 连通性：listTopic 真实调用（接入链路 + 凭证）
+app.get('/api/mns/topics', mnsHandler(async (req, res) => {
+  const { inst, net } = pickMns(req);
+  const client = await mnsClient(inst, net);
+  if (!mnsReady(res, client, inst, net)) return;
+  const limit = Math.min(Math.max(parseInt(req.query.limit, 10) || 20, 1), 100);
+  const r = await client.listTopic(undefined, limit, req.query.prefix);
+  const topics = Array.isArray(r.body) ? r.body : (r.body ? [r.body] : []);
+  res.json({ inst, net, count: topics.length, topics });
+}));
+
+// 主题属性：连通性备选判据 + 主题元数据（默认用注入的测试主题）
+app.get('/api/mns/topic', mnsHandler(async (req, res) => {
+  const { inst, net, conf } = pickMns(req);
+  const client = await mnsClient(inst, net);
+  if (!mnsReady(res, client, inst, net)) return;
+  const name = req.query.name || conf.topic;
+  if (!name) {
+    res.status(400).json({ error: 'missing_topic', message: '需 query 参数 name 或注入 TOPIC_NAME' });
+    return;
+  }
+  const r = await client.getTopicAttributes(name);
+  res.json({ inst, net, topic: name, attributes: r.body });
+}));
+
+// 发布消息（主题模式）：仅允许注入的测试主题或 probe- 前缀主题
+app.post('/api/mns/publish', mnsHandler(async (req, res) => {
+  const { inst, net, conf } = pickMns(req);
+  const client = await mnsClient(inst, net);
+  if (!mnsReady(res, client, inst, net)) return;
+  const { topic, message } = req.body || {};
+  const target = topic || conf.topic;
+  if (!target || typeof message !== 'string') {
+    res.status(400).json({ error: 'empty_body', message: '请求体需含字符串 message；topic 缺省用注入的测试主题' });
+    return;
+  }
+  if (target !== conf.topic && !target.startsWith('probe-')) {
+    res.status(403).json({ error: 'topic_not_allowed', message: '发布仅限注入的测试主题或 probe- 前缀主题' });
+    return;
+  }
+  const r = await client.publishMessage(target, { MessageBody: message });
+  res.status(201).json({ inst, net, topic: target, messageId: r.body && r.body.MessageId });
 }));
 
 // 全局错误处理中间件（四参数，Express 识别为错误处理器）
