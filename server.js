@@ -5,7 +5,7 @@ const express = require('express');
 const path = require('path');
 const { createClient } = require('@supabase/supabase-js');
 const OSS = require('ali-oss');
-const Credential = require('@alicloud/credentials');
+const Credential = require('@alicloud/credentials').default;
 const app = express();
 
 app.use(express.json());
