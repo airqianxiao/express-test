@@ -4,6 +4,8 @@
 const express = require('express');
 const path = require('path');
 const { createClient } = require('@supabase/supabase-js');
+const OSS = require('ali-oss');
+const Credential = require('@alicloud/credentials');
 const app = express();
 
 app.use(express.json());
@@ -286,6 +288,182 @@ app.delete('/api/db/:schema/:table/:id', dbHandler(async (req, res) => {
     return;
   }
   res.json({ schema, table, deleted: data[0] });
+}));
+
+// ---------------------------------------------------------------------------
+// OSS 读写路由（ali-oss SDK + @alicloud/credentials 凭证链）
+// PRD §4.3：STS 临时凭证不落函数变量，凭证链从 ALIBABA_CLOUD_CREDENTIALS_URI 拉取并自动续期
+// ?net=public 切链路（默认内网）；X-Oss-* 头留证；写/删仅限 probe/ 前缀防误伤桶内对象
+// ---------------------------------------------------------------------------
+const OSS_CONF = {
+  bucket: process.env.SJYQ_OSS_ASSETS_BUCKET,
+  region: process.env.SJYQ_OSS_ASSETS_REGION,
+  endpoints: {
+    internal: process.env.SJYQ_OSS_ASSETS_ENDPOINT_INTERNAL,
+    public: process.env.SJYQ_OSS_ASSETS_ENDPOINT_PUBLIC,
+  },
+};
+
+// 凭证来源判别：credentials_uri=PRD 方式 A；static_sts_env=早期错误实现（观察项）；其余走默认凭证链
+function ossCredentialSource() {
+  if (process.env.ALIBABA_CLOUD_CREDENTIALS_URI) return 'credentials_uri';
+  if (process.env.ALIBABA_CLOUD_ACCESS_KEY_ID && process.env.ALIBABA_CLOUD_SECURITY_TOKEN) return 'static_sts_env';
+  return 'default_chain';
+}
+// 延迟构造：凭证链缺失时只影响 OSS 路由，不让进程启动即崩
+let ossCred = null;
+function ossCredential() {
+  if (!ossCred) {
+    ossCred = process.env.ALIBABA_CLOUD_CREDENTIALS_URI
+      ? new Credential({ type: 'credentials_uri', credentialsURI: process.env.ALIBABA_CLOUD_CREDENTIALS_URI })
+      : new Credential();
+  }
+  return ossCred;
+}
+
+const ossClients = {};
+async function ossClient(net) {
+  if (ossClients[net]) return ossClients[net];
+  const endpoint = OSS_CONF.endpoints[net];
+  if (!OSS_CONF.bucket || !endpoint) return null;
+  const c = await ossCredential().getCredential();
+  // 注入 region 为 cn-beijing 式（PRD 示例为 oss-cn-beijing 式），补 oss- 前缀兼容 SDK
+  const region = OSS_CONF.region && !OSS_CONF.region.startsWith('oss-') ? `oss-${OSS_CONF.region}` : OSS_CONF.region;
+  ossClients[net] = new OSS({
+    region,
+    bucket: OSS_CONF.bucket,
+    endpoint,
+    accessKeyId: c.accessKeyId,
+    accessKeySecret: c.accessKeySecret,
+    stsToken: c.securityToken,
+    secure: true,
+    refreshSTSToken: async () => {
+      const n = await ossCredential().getCredential();
+      return { accessKeyId: n.accessKeyId, accessKeySecret: n.accessKeySecret, stsToken: n.securityToken };
+    },
+    refreshSTSTokenInterval: 15 * 60 * 1000,
+  });
+  return ossClients[net];
+}
+
+function ossReady(res, client, net) {
+  if (!client) {
+    res.status(503).json({
+      error: 'oss_not_configured',
+      message: `缺少环境变量：SJYQ_OSS_ASSETS_${net === 'public' ? 'ENDPOINT_PUBLIC' : 'ENDPOINT_INTERNAL'} / SJYQ_OSS_ASSETS_BUCKET`,
+    });
+    return false;
+  }
+  return true;
+}
+
+function ossErrorStatus(err) {
+  switch (err.code) {
+    case 'NoSuchKey': case 'NoSuchBucket': return 404;
+    case 'AccessDenied': case 'InvalidAccessKeyId': case 'SecurityTokenExpired': case 'InvalidSecurityToken': return 403;
+    default: break;
+  }
+  const sc = Number(err.status || err.statusCode);
+  if (sc >= 400 && sc < 600) return sc;
+  if (err instanceof TypeError || err.name === 'TypeError' || /fetch failed|ECONNREFUSED|ENOTFOUND|ETIMEDOUT|EAI_AGAIN/.test(err.code || err.message)) return 502;
+  return 500;
+}
+const ossHandler = (fn) => asyncHandler(async (req, res) => {
+  const net = req.query.net === 'public' ? 'public' : 'internal';
+  res.set('X-Oss-Net', net);
+  res.set('X-Oss-Bucket', OSS_CONF.bucket || '(missing)');
+  res.set('X-Oss-Endpoint', OSS_CONF.endpoints[net] || '(missing)');
+  try {
+    await fn(req, res);
+  } catch (err) {
+    const cause = err.cause ? ` (cause: ${err.cause.code || err.cause.message})` : '';
+    console.error('[oss-error]', net, err.code || err.status, err.message + cause);
+    res.status(ossErrorStatus(err)).json({ error: 'oss_error', net, code: err.code || err.status, message: err.message + cause });
+  }
+});
+const ossNet = (req) => (req.query.net === 'public' ? 'public' : 'internal');
+// 写/删只允许 probe/ 前缀（测试命名空间），读/列举不限
+const ossWriteKeyCheck = (key, res) => {
+  if (!key || !key.startsWith('probe/')) {
+    res.status(403).json({ error: 'key_not_allowed', message: '写/删仅限 probe/ 前缀对象' });
+    return false;
+  }
+  return true;
+};
+
+// 配置回显（不含密钥）：核对注入变量与凭证通道是否就绪
+app.get('/api/oss/config', (req, res) => {
+  res.json({
+    bucket: OSS_CONF.bucket,
+    region: OSS_CONF.region,
+    endpoints: OSS_CONF.endpoints,
+    credentialSource: ossCredentialSource(),
+    credentialsUriPresent: Boolean(process.env.ALIBABA_CLOUD_CREDENTIALS_URI),
+    roleArnPresent: Boolean(process.env.ALIBABA_CLOUD_ROLE_ARN),
+  });
+});
+
+// 连通性检查：getBucketInfo 真实调用，验证链路 + 凭证
+app.get('/api/oss/health', ossHandler(async (req, res) => {
+  const net = ossNet(req);
+  const client = await ossClient(net);
+  if (!ossReady(res, client, net)) return;
+  const info = await client.getBucketInfo();
+  res.json({
+    ok: true, net, bucket: OSS_CONF.bucket, endpoint: OSS_CONF.endpoints[net],
+    credentialSource: ossCredentialSource(), location: info.bucket.Location, storageClass: info.bucket.StorageClass,
+  });
+}));
+
+// 读：列举对象（prefix/limit）
+app.get('/api/oss/objects', ossHandler(async (req, res) => {
+  const net = ossNet(req);
+  const client = await ossClient(net);
+  if (!ossReady(res, client, net)) return;
+  const limit = Math.min(Math.max(parseInt(req.query.limit, 10) || 20, 1), 100);
+  const r = await client.list({ prefix: req.query.prefix || '', 'max-keys': limit }, {});
+  const objects = (r.objects || []).map((o) => ({ name: o.name, size: o.size, lastModified: o.lastModified }));
+  res.json({ net, prefix: req.query.prefix || '', count: objects.length, isTruncated: r.isTruncated, objects });
+}));
+
+// 读：按 key 取对象内容（文本）
+app.get('/api/oss/object', ossHandler(async (req, res) => {
+  const net = ossNet(req);
+  const client = await ossClient(net);
+  if (!ossReady(res, client, net)) return;
+  const key = req.query.key;
+  if (!key) {
+    res.status(400).json({ error: 'missing_key', message: 'query 参数 key 必填' });
+    return;
+  }
+  const r = await client.get(key);
+  res.json({ net, key, content: r.content.toString('utf8') });
+}));
+
+// 写：上传对象（probe/ 前缀）
+app.post('/api/oss/object', ossHandler(async (req, res) => {
+  const net = ossNet(req);
+  const client = await ossClient(net);
+  if (!ossReady(res, client, net)) return;
+  const { key, content } = req.body || {};
+  if (!key || typeof content !== 'string') {
+    res.status(400).json({ error: 'empty_body', message: '请求体需含 key 与字符串 content' });
+    return;
+  }
+  if (!ossWriteKeyCheck(key, res)) return;
+  const r = await client.put(key, Buffer.from(content, 'utf8'));
+  res.status(201).json({ net, key, name: r.name, url: r.url });
+}));
+
+// 写：按 key 删除（probe/ 前缀；OSS 删不存在对象也 204，删后判存在用 GET 404）
+app.delete('/api/oss/object', ossHandler(async (req, res) => {
+  const net = ossNet(req);
+  const client = await ossClient(net);
+  if (!ossReady(res, client, net)) return;
+  const key = req.query.key;
+  if (!ossWriteKeyCheck(key, res)) return;
+  await client.delete(key);
+  res.json({ net, deleted: key });
 }));
 
 // 全局错误处理中间件（四参数，Express 识别为错误处理器）
