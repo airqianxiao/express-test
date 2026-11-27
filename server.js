@@ -307,15 +307,6 @@ const OSS_INSTANCES = {
       region: 'SJYQ_OSS_ASSETS_REGION',
     },
   },
-  ywpx: {
-    region: 'hangzhou',
-    vars: {
-      bucket: 'YWPX_OSS_ASSETS_BUCKET',
-      internal: 'YWPX_OSS_ASSETS_ENDPOINT_INTERNAL',
-      public: 'YWPX_OSS_ASSETS_ENDPOINT_PUBLIC',
-      region: 'YWPX_OSS_ASSETS_REGION',
-    },
-  },
 };
 for (const conf of Object.values(OSS_INSTANCES)) {
   conf.bucket = process.env[conf.vars.bucket];
@@ -516,6 +507,15 @@ const MNS_INSTANCES = {
       topic: 'BZ8L_MNS_TOPIC_NAME',
     },
   },
+  xwpb: {
+    region: 'hangzhou',
+    vars: {
+      internal: 'XWPB_MNS_ASSETS_ENDPOINT_INTERNAL',
+      public: 'XWPB_MNS_ASSETS_ENDPOINT_PUBLIC',
+      region: 'XWPB_MNS_REGION',
+      topic: 'XWPB_MNS_TOPIC_NAME',
+    },
+  },
 };
 for (const conf of Object.values(MNS_INSTANCES)) {
   conf.region = process.env[conf.vars.region];
@@ -624,7 +624,7 @@ app.get('/api/mns/topics', mnsHandler(async (req, res) => {
   const client = await mnsClient(inst, net);
   if (!mnsReady(res, client, inst, net)) return;
   const limit = Math.min(Math.max(parseInt(req.query.limit, 10) || 20, 1), 100);
-  const r = await client.listTopic(undefined, limit, req.query.prefix);
+  const r = await client.listTopic(undefined, limit, req.query.prefix || '');
   const topics = Array.isArray(r.body) ? r.body : (r.body ? [r.body] : []);
   res.json({ inst, net, count: topics.length, topics });
 }));
