@@ -294,7 +294,7 @@ app.delete('/api/db/:schema/:table/:id', dbHandler(async (req, res) => {
 // ---------------------------------------------------------------------------
 // OSS 读写路由（ali-oss SDK + @alicloud/credentials 凭证链）
 // PRD §4.3：STS 临时凭证不落函数变量，凭证链从 ALIBABA_CLOUD_CREDENTIALS_URI 拉取并自动续期
-// 多集成共存：?inst=sjyq|ywpx 选实例（默认 sjyq），?net=public 切链路（默认内网）
+// 多集成共存：?inst=sjyq|d03s 选实例（默认 sjyq），?net=public 切链路（默认内网）
 // X-Oss-* 头留证；写/删仅限 probe/ 前缀防误伤桶内对象
 // ---------------------------------------------------------------------------
 const OSS_INSTANCES = {
@@ -305,6 +305,15 @@ const OSS_INSTANCES = {
       internal: 'SJYQ_OSS_ASSETS_ENDPOINT_INTERNAL',
       public: 'SJYQ_OSS_ASSETS_ENDPOINT_PUBLIC',
       region: 'SJYQ_OSS_ASSETS_REGION',
+    },
+  },
+  d03s: {
+    region: 'hangzhou',
+    vars: {
+      bucket: 'D03S_OSS_ASSETS_BUCKET',
+      internal: 'D03S_OSS_ASSETS_ENDPOINT_INTERNAL',
+      public: 'D03S_OSS_ASSETS_ENDPOINT_PUBLIC',
+      region: 'D03S_OSS_ASSETS_REGION',
     },
   },
 };
